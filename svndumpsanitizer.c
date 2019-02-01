@@ -50,7 +50,9 @@
 typedef struct node {
 	struct node **deps;
 	char *path;
+    char *newPath;
 	char *copyfrom;
+	char *newCopyfrom;
 	int copyfrom_rev;
 	int revision;
 	unsigned short dep_len;
@@ -139,6 +141,13 @@ void show_help_and_exit() {
 	printf("\t\tThis query will locate the *first* dependency it can find that will include the file,\n");
 	printf("\t\tnot all the dependencies, which might be numerous. When done, one can opt to either\n");
 	printf("\t\tquit or proceed with writing the outfile.\n\n");
+	printf("\t-m, --move\n");
+	printf("\t\trename path\n");
+	printf("\t\treading and analyzing (but before writing) enter an interactive state where the user\n");
+	printf("\t\tcan query the rationale why specific files are being included with the given options.\n");
+	printf("\t\tThis query will locate the *first* dependency it can find that will include the file,\n");
+	printf("\t\tnot all the dependencies, which might be numerous. When done, one can opt to either\n");
+	printf("\t\tquit or proceed with writing the outfile.\n\n");
 	printf("\t-v, --version\n");
 	printf("\t\tPrint version and exit.\n");
 	exit(0);
@@ -175,11 +184,11 @@ char* add_slash_to(char *str) {
 	return new_str;
 }
 
-// Returns 1 if string a starts with string b, otherwise 0
-int starts_with(char *a, char *b) {
+// Returns 1 if string str starts with string needle, otherwise 0
+int starts_with(const char *str, const char *needle) {
 	int i = 0;
-	while (b[i] != '\0') {
-		if (a[i] != b[i]) {
+	while (needle[i] != '\0') {
+		if (str[i] != needle[i]) {
 			return 0;
 		}
 		++i;
@@ -935,6 +944,45 @@ void write_mergeinfo(FILE *outfile, mergedata *data, revision *revisions, char *
 	}
 }
 
+int verbose = 0;
+char **moveFrom = NULL; // Holds the paths the user wants to rename from
+char **moveTo = NULL; // Holds the paths the user wants to rename to
+int mov_len = 0;
+
+int detectRename(char **destination, const char *sourcePath) {
+    *destination = NULL;
+
+    if (moveFrom && moveTo) {
+        const size_t oripathlen = strlen(sourcePath);
+
+        for (int mvi = 0; mvi < mov_len; mvi++) {
+            char *from = moveFrom[mvi];
+            char *to = moveTo[mvi];
+            int n = starts_with(sourcePath, from);
+            if (n) {
+                if (verbose) printf("node rename [%s]", sourcePath);
+                size_t fromLen = strlen(from);
+                size_t toLen = strlen(to);
+                char *newPath = str_malloc(oripathlen - fromLen + toLen + 1);
+                strcpy(newPath, to);
+                if (oripathlen > fromLen) {
+                    strcpy(&newPath[toLen], &sourcePath[fromLen]);
+                }
+                if (verbose) printf(" -> [%s]\n", newPath);
+
+                *destination = str_malloc(strlen(newPath) + 1);
+                strcpy(*destination, newPath);
+
+                free(newPath);
+
+                return 1;
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
 /*******************************************************************************
  *
  * Main method
@@ -943,7 +991,8 @@ void write_mergeinfo(FILE *outfile, mergedata *data, revision *revisions, char *
 
 int main(int argc, char **argv) {
 	// Misc temporary variables
- 	int i, j, k, ch, want_by_default, new_number, empty, temp_int, is_dir, should_do, maxp_len;
+ 	int i, j, k, ch, new_number, empty, temp_int, is_dir, should_do, maxp_len;
+    char want_by_default;
 	off_t offset, con_len, pcon_len;
 	time_t rawtime;
 	struct tm *ptm;
@@ -958,6 +1007,7 @@ int main(int argc, char **argv) {
 	int in = 0;
 	int out = 0;
 	int incl = 0;
+	int move = 0;
 	int excl = 0;
 	int drop = 0;
 	int redef = 0;
@@ -1032,6 +1082,8 @@ int main(int argc, char **argv) {
 			if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
 				free(current_line);
 				free(revisions);
+				free(moveFrom);
+				free(moveTo);
 				free(include);
 				free(exclude);
 				show_help_and_exit();
@@ -1039,6 +1091,8 @@ int main(int argc, char **argv) {
 			if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
 				free(current_line);
 				free(revisions);
+				free(moveFrom);
+				free(moveTo);
 				free(include);
 				free(exclude);
 				show_version_and_exit();
@@ -1051,7 +1105,8 @@ int main(int argc, char **argv) {
 			redef = (!strcmp(argv[i], "--redefine-root") || !strcmp(argv[i], "-r"));
 			del = (!strcmp(argv[i], "--add-delete") || !strcmp(argv[i], "-a"));
 			why = (!strcmp(argv[i], "--query") || !strcmp(argv[i], "-q"));
-			if (!(in || out || incl || excl || drop || redef || del || why)) {
+			move = (!strcmp(argv[i], "--move") || !strcmp(argv[i], "-m"));
+			if (!(in || out || incl || excl || drop || redef || del || why || move)) {
 				exit_with_error(strcat(argv[i], " is not a valid parameter. Use -h for help."), 1);
 			}
 			else if (drop) {
@@ -1076,6 +1131,37 @@ int main(int argc, char **argv) {
 				exit_with_error(strcat(argv[i], " can not be opened as outfile") , 3);
 			}
 		}
+		else if (move) {
+			if ((moveFrom = (char**)realloc(moveFrom, (mov_len + 1) * sizeof(char*))) == NULL) {
+				exit_with_error("realloc failed", 2);
+			}
+			if ((moveTo = (char**)realloc(moveTo, (mov_len + 1) * sizeof(char*))) == NULL) {
+				exit_with_error("realloc failed", 2);
+			}
+			// Allow the user to escape a directory in the repository root, that starts with a
+			// hyphen, using a slash.
+			if (starts_with(argv[i], "/")) {
+				moveFrom[mov_len] = &argv[i][1];
+			}
+			else {
+				moveFrom[mov_len] = argv[i];
+			}
+            //printf("from: %s (%d:%s)\n", moveFrom[mov_len], i, argv[i]);
+			i++;
+			if (i >= argc) {
+				exit_with_error("move to not specified", 2);
+			}
+			// Allow the user to escape a directory in the repository root, that starts with a
+			// hyphen, using a slash.
+			if (starts_with(argv[i], "/")) {
+				moveTo[mov_len] = &argv[i][1];
+			}
+			else {
+				moveTo[mov_len] = argv[i];
+			}
+            //printf("to: %s (%d:%s)\n", moveTo[mov_len], i, argv[i]);
+			++mov_len;
+		}
 		else if (incl) {
 			if ((include = (char**)realloc(include, (inc_len + 1) * sizeof(char*))) == NULL) {
 				exit_with_error("realloc failed", 2);
@@ -1088,7 +1174,7 @@ int main(int argc, char **argv) {
 			else {
 				include[inc_len] = argv[i];
 			}
-			++inc_len;			
+			++inc_len;
 		}
 		else if (excl) {
 			if ((exclude = (char**)realloc(exclude, (exc_len + 1) * sizeof(char*))) == NULL) {
@@ -1121,12 +1207,12 @@ int main(int argc, char **argv) {
 #endif
 		messages = stderr;
 	}
-	if (include == NULL && exclude == NULL) {
+	if (include == NULL && exclude == NULL && moveFrom == NULL) {
 		fclose(infile);
 		if (to_file) {
 			fclose(outfile);
 		}
-		exit_with_error("You must specify something to either include or exclude", 1);
+		exit_with_error("You must specify something to either include or exclude or move", 1);
 	}
 	if (include != NULL && exclude != NULL) {
 		fclose(infile);
@@ -1161,6 +1247,8 @@ int main(int argc, char **argv) {
 	}
 	want_by_default = 10;
 	if (include) {
+		want_by_default = 0;
+	} else if (moveFrom) {
 		want_by_default = 0;
 	}
 
@@ -1224,6 +1312,8 @@ int main(int argc, char **argv) {
 				else if (starts_with(current_line, "Node-copyfrom-path: ")) {
 					current_node[nod_len].copyfrom = str_malloc(strlen(&current_line[19]));
 					strcpy(current_node[nod_len].copyfrom, &current_line[20]);
+
+                    detectRename(&current_node[nod_len].newCopyfrom, &current_line[20]);
 				}
 				else if (starts_with(current_line, "Node-copyfrom-rev: ")) {
 					current_node[nod_len].copyfrom_rev = atoi(&current_line[19]);
@@ -1246,6 +1336,10 @@ int main(int argc, char **argv) {
 				current_node[nod_len].wanted = want_by_default;
 				current_node[nod_len].revision = rev_len;
 				reading_node = 1;
+
+                current_node[nod_len].newPath = NULL;
+                current_node[nod_len].newCopyfrom = NULL;
+                detectRename(&current_node[nod_len].newPath, &current_line[11]);
 			}
 			else if (starts_with(current_line,"Revision-number: ")) {
 				if (rev_len >= 0) {
@@ -1396,7 +1490,7 @@ int main(int argc, char **argv) {
 		}
 	}
 	// Exclude strategy
-	else {
+	else if (exclude) {
 		if ((exc_slash = (char**)malloc(exc_len * sizeof(char*))) == NULL) {
 			exit_with_error("malloc failed", 2);
 		}
@@ -1416,6 +1510,17 @@ int main(int argc, char **argv) {
 				if (!is_cluded(revisions[i].fakes[j]->path, exclude, exc_slash, exc_len)) {
 					set_wanted(revisions[i].fakes[j]);
 				}
+			}
+		}
+	}
+	else {
+        // move (implicit include all)
+		for (i = rev_len - 1; i > 0; --i) {
+			for (j = 0; j < revisions[i].size; ++j) {
+				set_wanted(&revisions[i].nodes[j]);
+			}
+			for (j = 0; j < revisions[i].fake_size; ++j) {
+				set_wanted(revisions[i].fakes[j]);
 			}
 		}
 	}
@@ -1619,6 +1724,10 @@ int main(int argc, char **argv) {
 					toggle = 1;
 					free(temp_str);	
 				}
+                else if(writing && revisions[rev].nodes[nod].newCopyfrom && starts_with(current_line, "Node-copyfrom-path: ")) {
+                    fprintf(outfile, "Node-copyfrom-path: %s\n", revisions[rev].nodes[nod].newCopyfrom);
+                    toggle = 1;
+                }
 				else if (act_mi >= 0 && mi[act_mi].revision == rev && mi[act_mi].node == nod && starts_with(current_line, "Prop-content-length: ")) {
 					pcon_len = (off_t)atol(&current_line[21]);
 					toggle = 1;
@@ -1662,7 +1771,10 @@ int main(int argc, char **argv) {
 				}
 				pcon_len = 0;
 				writing = revisions[rev].nodes[nod].wanted;
-				if (writing && redefined_root != NULL) {
+                if (writing && revisions[rev].nodes[nod].newPath) {
+                    fprintf(outfile, "Node-path: %s\n", revisions[rev].nodes[nod].newPath);
+                    toggle = 1;
+                } else if (writing && redefined_root != NULL) {
 					temp_str = reduce_path(redefined_root, &current_line[11]);
 					fprintf(outfile, "Node-path: %s\n", temp_str);
 					toggle = 1;
